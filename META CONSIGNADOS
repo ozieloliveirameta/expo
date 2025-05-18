@@ -1,0 +1,209 @@
+// Protótipo de app para controle de produtos consignados (offline e versão web)
+// Mobile: React Native + Expo + SQLite
+// Web: React + IndexedDB (com fallback para evitar erro de bundling fora de ambiente suportado)
+
+import React, { useEffect, useState } from "react";
+import { View, Text, TextInput, Button, FlatList, Alert, ScrollView, Platform } from "react-native";
+import * as SQLite from "expo-sqlite";
+import { BarCodeScanner } from "expo-barcode-scanner";
+
+const isWeb = typeof window !== "undefined" && Platform.OS === "web";
+
+let idb;
+if (isWeb) {
+  const openIndexedDB = () => {
+    const request = window.indexedDB.open("ConsignadosDB", 1);
+    request.onupgradeneeded = (event) => {
+      const db = event.target.result;
+      db.createObjectStore("produtos", { keyPath: "id", autoIncrement: true });
+    };
+    request.onsuccess = (event) => {
+      idb = event.target.result;
+    };
+  };
+  openIndexedDB();
+}
+
+const db = !isWeb ? SQLite.openDatabase("consignados.db") : null;
+
+export default function App() {
+  const [produtos, setProdutos] = useState([]);
+  const [nome, setNome] = useState("");
+  const [quantidade, setQuantidade] = useState("");
+  const [preco, setPreco] = useState("");
+  const [sincronizando, setSincronizando] = useState(false);
+  const [hasPermission, setHasPermission] = useState(null);
+  const [scanning, setScanning] = useState(false);
+
+  useEffect(() => {
+    if (!isWeb) {
+      (async () => {
+        const { status } = await BarCodeScanner.requestPermissionsAsync();
+        setHasPermission(status === "granted");
+      })();
+    }
+  }, []);
+
+  useEffect(() => {
+    if (isWeb) {
+      const interval = setInterval(() => {
+        if (idb) {
+          clearInterval(interval);
+          carregarProdutosWeb();
+        }
+      }, 100);
+    } else {
+      db.transaction((tx) => {
+        tx.executeSql(
+          "CREATE TABLE IF NOT EXISTS produtos (id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT, quantidade INT, preco REAL);"
+        );
+      }, null, carregarProdutos);
+    }
+  }, []);
+
+  const carregarProdutos = () => {
+    db.transaction((tx) => {
+      tx.executeSql("SELECT * FROM produtos", [], (_, { rows }) => {
+        setProdutos(rows._array);
+      });
+    });
+  };
+
+  const carregarProdutosWeb = () => {
+    const tx = idb.transaction("produtos", "readonly");
+    const store = tx.objectStore("produtos");
+    const request = store.getAll();
+    request.onsuccess = () => {
+      setProdutos(request.result);
+    };
+  };
+
+  const adicionarProduto = () => {
+    if (!nome || !quantidade || !preco) {
+      Alert.alert("Erro", "Preencha todos os campos");
+      return;
+    }
+
+    const novoProduto = {
+      nome,
+      quantidade: parseInt(quantidade),
+      preco: parseFloat(preco),
+    };
+
+    if (isWeb) {
+      const tx = idb.transaction("produtos", "readwrite");
+      const store = tx.objectStore("produtos");
+      store.add(novoProduto);
+      tx.oncomplete = () => {
+        setNome("");
+        setQuantidade("");
+        setPreco("");
+        carregarProdutosWeb();
+      };
+    } else {
+      db.transaction((tx) => {
+        tx.executeSql(
+          "INSERT INTO produtos (nome, quantidade, preco) VALUES (?, ?, ?)",
+          [novoProduto.nome, novoProduto.quantidade, novoProduto.preco],
+          () => {
+            setNome("");
+            setQuantidade("");
+            setPreco("");
+            carregarProdutos();
+          }
+        );
+      });
+    }
+  };
+
+  const venderProduto = (id) => {
+    if (isWeb) {
+      const tx = idb.transaction("produtos", "readwrite");
+      const store = tx.objectStore("produtos");
+      const getRequest = store.get(id);
+      getRequest.onsuccess = () => {
+        const produto = getRequest.result;
+        if (produto.quantidade > 0) {
+          produto.quantidade -= 1;
+          store.put(produto);
+          tx.oncomplete = () => carregarProdutosWeb();
+        }
+      };
+    } else {
+      db.transaction((tx) => {
+        tx.executeSql(
+          "UPDATE produtos SET quantidade = quantidade - 1 WHERE id = ? AND quantidade > 0",
+          [id],
+          () => carregarProdutos()
+        );
+      });
+    }
+  };
+
+  const sincronizar = () => {
+    if (isWeb || !db || !idb) return;
+
+    setSincronizando(true);
+    db.transaction((tx) => {
+      tx.executeSql("SELECT * FROM produtos", [], (_, { rows }) => {
+        const dados = rows._array;
+        const txWeb = idb.transaction("produtos", "readwrite");
+        const storeWeb = txWeb.objectStore("produtos");
+
+        dados.forEach((produto) => {
+          storeWeb.put(produto);
+        });
+
+        txWeb.oncomplete = () => {
+          setSincronizando(false);
+          carregarProdutosWeb();
+          Alert.alert("Sucesso", "Dados sincronizados com a versão web");
+        };
+      });
+    });
+  };
+
+  const handleBarCodeScanned = ({ type, data }) => {
+    setScanning(false);
+    Alert.alert("Código escaneado", `Tipo: ${type}\nValor: ${data}`);
+    setNome(data);
+  };
+
+  return (
+    <ScrollView contentContainerStyle={{ padding: 20, marginTop: 40 }}>
+      <Text style={{ fontSize: 20, fontWeight: "bold" }}>Cadastro de Produto</Text>
+      {!isWeb && scanning ? (
+        <View style={{ height: 300, marginVertical: 10 }}>
+          <BarCodeScanner
+            onBarCodeScanned={handleBarCodeScanned}
+            style={{ flex: 1 }}
+          />
+          <Button title="Cancelar" onPress={() => setScanning(false)} />
+        </View>
+      ) : (
+        <>
+          <TextInput placeholder="Nome" value={nome} onChangeText={setNome} style={{ borderWidth: 1, marginVertical: 5 }} />
+          {!isWeb && <Button title="Escanear Código de Barras/QR" onPress={() => setScanning(true)} />}
+          <TextInput placeholder="Quantidade" keyboardType="numeric" value={quantidade} onChangeText={setQuantidade} style={{ borderWidth: 1, marginVertical: 5 }} />
+          <TextInput placeholder="Preço" keyboardType="decimal-pad" value={preco} onChangeText={setPreco} style={{ borderWidth: 1, marginVertical: 5 }} />
+          <Button title="Adicionar Produto" onPress={adicionarProduto} />
+          {!isWeb && <Button title={sincronizando ? "Sincronizando..." : "Sincronizar com Web"} onPress={sincronizar} disabled={sincronizando} />}
+        </>
+      )}
+
+      <Text style={{ fontSize: 20, marginTop: 20 }}>Produtos</Text>
+      <FlatList
+        data={produtos}
+        keyExtractor={(item) => item.id?.toString()}
+        renderItem={({ item }) => (
+          <View style={{ padding: 10, borderBottomWidth: 1 }}>
+            <Text>{item.nome}</Text>
+            <Text>Estoque: {item.quantidade}</Text>
+            <Text>Preço: R$ {item.preco?.toFixed(2)}</Text>
+            <Button title="Vender 1 unidade" onPress={() => venderProduto(item.id)} />
+          </View>
+        )}
+      />
+    </ScrollView>
+  );
+}
